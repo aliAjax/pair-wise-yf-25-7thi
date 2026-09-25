@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>录用定稿</title>
+<style>body{font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:90px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}</style></head>
+<body><h1>录用定稿</h1>
+<p>决定为接收或小修后，作者提交最终标题、摘要、作者顺序与排版说明（系统保留新版本、送审版转只读）；最终标题或作者顺序变更时，主席须核对并填写变更原因，签字后论文封版。排版说明为空将退回待提交。返回 <a href="/">投稿页面</a>。</p>
+<p><select id="user"><option>alice</option><option>bob</option><option>r1</option><option>r2</option><option>r3</option><option>chair</option></select><input id="pid" type="number" min="1" placeholder="论文ID"></p>
+<div class="grid">
+<section class="panel"><h2>作者：提交定稿</h2>
+<input id="ftitle" placeholder="最终标题">
+<textarea id="fabstract" placeholder="最终摘要（至少20字）"></textarea>
+<input id="fauthors" placeholder="作者顺序，逗号分隔，如 alice,bob">
+<textarea id="fnotes" placeholder="排版说明（必填，空则退回待提交）"></textarea>
+<button onclick="submitFinal()">提交定稿</button></section>
+<section class="panel"><h2>主席：核对并签字</h2>
+<button onclick="loadFinal()">加载定稿记录（含送审版对照）</button>
+<pre id="recOut">尚未加载</pre>
+<input id="freason" placeholder="变更原因（标题或作者顺序变更时必填）">
+<button onclick="approveFinal()">核对通过并签字封版</button></section>
+</div>
+<section class="panel"><h2>版本记录</h2><button onclick="loadVersions()">刷新版本（旧版与只读标记）</button><pre id="verOut">尚未加载</pre></section>
+<script>
+const headers={"Content-Type":"application/json","X-User-Id":document.querySelector("#user").value};
+document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
+async function api(url,opt={}){const r=await fetch(url,{...opt,headers});const j=await r.json();if(!r.ok)throw j;return j}
+async function guard(fn){try{return await fn()}catch(e){alert(JSON.stringify(e,null,2))}}
+function submitFinal(){guard(async()=>{
+  const body={
+    title:ftitle.value,
+    abstract:fabstract.value,
+    author_order:fauthors.value.split(/[,，]/).map(s=>s.trim()).filter(Boolean),
+    format_notes:fnotes.value
+  };
+  alert(JSON.stringify(await api(`/api/papers/${pid.value}/final`,{method:"POST",body:JSON.stringify(body)}),null,2));
+})}
+function loadFinal(){guard(async()=>{recOut.textContent=JSON.stringify(await api(`/api/papers/${pid.value}/final`),null,2)})}
+function approveFinal(){guard(async()=>{
+  alert(JSON.stringify(await api(`/api/papers/${pid.value}/final/approve`,{method:"POST",body:JSON.stringify({change_reason:freason.value})}),null,2));
+})}
+function loadVersions(){guard(async()=>{verOut.textContent=JSON.stringify(await api(`/api/papers/${pid.value}/versions`),null,2)})}
+</script></body></html>

@@ -2,31 +2,20 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from common import BusinessError, connect as db_connect, get_user, require_role, utcnow, write_audit
+from finalization import FinalizationService
+from versions import VersionStore
+
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "review.db"
 VALID_DECISIONS = {"accept", "reject", "minor_revision", "major_revision"}
-
-
-class BusinessError(Exception):
-    def __init__(self, message: str, status: int = 400, code: str = "bad_request"):
-        super().__init__(message)
-        self.message = message
-        self.status = status
-        self.code = code
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class ReviewStore:
@@ -35,13 +24,11 @@ class ReviewStore:
     def __init__(self, db_path: str | Path = DEFAULT_DB):
         self.db_path = str(db_path)
         self._schema_lock = threading.Lock()
+        self.versions = VersionStore(self.db_path)          # 版本存储，见 versions.py
+        self.finals = FinalizationService(self.db_path, self.versions)  # 核对规则，见 finalization.py
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 10000")
-        return conn
+        return db_connect(self.db_path)
 
     def init_schema(self) -> None:
         with self._schema_lock, self.connect() as conn:
@@ -59,16 +46,8 @@ class ReviewStore:
                     title TEXT NOT NULL,
                     abstract TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'submitted'
-                        CHECK (status IN ('submitted','under_review','decided','withdrawn')),
+                        CHECK (status IN ('submitted','under_review','decided','withdrawn','finalized')),
                     created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS paper_versions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    paper_id INTEGER NOT NULL REFERENCES papers(id),
-                    version INTEGER NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE (paper_id, version)
                 );
                 CREATE TABLE IF NOT EXISTS conflicts (
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
@@ -124,6 +103,37 @@ class ReviewStore:
                 );
                 """
             )
+            self._migrate_papers(conn)
+        self.versions.init_schema()
+        self.finals.init_schema()
+
+    def _migrate_papers(self, conn: sqlite3.Connection) -> None:
+        """旧库的 papers.status CHECK 不含 'finalized' 时，按官方推荐方式重建该表。"""
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='papers'"
+        ).fetchone()
+        if not row or "'finalized'" in row[0]:
+            return
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.executescript(
+            """
+            BEGIN;
+            CREATE TABLE papers_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                author_id TEXT NOT NULL REFERENCES users(id),
+                title TEXT NOT NULL,
+                abstract TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'submitted'
+                    CHECK (status IN ('submitted','under_review','decided','withdrawn','finalized')),
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO papers_new SELECT * FROM papers;
+            DROP TABLE papers;
+            ALTER TABLE papers_new RENAME TO papers;
+            COMMIT;
+            """
+        )
+        conn.execute("PRAGMA foreign_keys = ON")
 
     def seed(self) -> None:
         self.init_schema()
@@ -141,29 +151,19 @@ class ReviewStore:
             )
 
     def _user(self, conn: sqlite3.Connection, user_id: str | None) -> sqlite3.Row:
-        if not user_id:
-            raise BusinessError("缺少 X-User-Id 请求头", 401, "authentication_required")
-        row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
-        if not row:
-            raise BusinessError("用户不存在", 401, "unknown_user")
-        return row
+        return get_user(conn, user_id)
 
     @staticmethod
     def _require(row: sqlite3.Row, role: str) -> None:
-        if row["role"] != role:
-            raise BusinessError(f"该操作仅允许 {role} 角色", 403, "forbidden")
+        require_role(row, role)
 
     def _audit(self, conn: sqlite3.Connection, paper_id: int | None, actor: str, action: str, detail: dict) -> None:
-        conn.execute(
-            "INSERT INTO audit_log(paper_id,actor_id,action,detail,created_at) VALUES(?,?,?,?,?)",
-            (paper_id, actor, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), utcnow()),
-        )
+        write_audit(conn, paper_id, actor, action, detail)
 
     def submit_paper(self, user_id: str, title: str, abstract: str) -> dict:
         title, abstract = title.strip(), abstract.strip()
         if len(title) < 3 or len(abstract) < 20:
             raise BusinessError("标题至少 3 字，摘要至少 20 字", 422, "invalid_paper")
-        digest = hashlib.sha256(f"{title}\n{abstract}".encode()).hexdigest()
         with self.connect() as conn:
             user = self._user(conn, user_id)
             self._require(user, "author")
@@ -172,12 +172,9 @@ class ReviewStore:
                 (user_id, title, abstract, utcnow()),
             )
             paper_id = cur.lastrowid
-            conn.execute(
-                "INSERT INTO paper_versions(paper_id,version,content_hash,created_at) VALUES(?,?,?,?)",
-                (paper_id, 1, digest, utcnow()),
-            )
-            self._audit(conn, paper_id, user_id, "paper.submit", {"version": 1, "sha256": digest})
-            return {"id": paper_id, "status": "submitted", "version": 1, "sha256": digest}
+            rec = self.versions.record(conn, paper_id, "submission", title, abstract, [user_id])
+            self._audit(conn, paper_id, user_id, "paper.submit", {"version": rec["version"], "sha256": rec["sha256"]})
+            return {"id": paper_id, "status": "submitted", "version": rec["version"], "sha256": rec["sha256"]}
 
     def _paper_view(self, conn: sqlite3.Connection, paper: sqlite3.Row, viewer: sqlite3.Row) -> dict:
         data = {
@@ -185,12 +182,16 @@ class ReviewStore:
             "title": paper["title"],
             "abstract": paper["abstract"],
             "status": paper["status"],
+            "final_status": self.finals.status_for(conn, paper["id"]),
             "created_at": paper["created_at"],
         }
         if viewer["role"] == "chair" or viewer["id"] == paper["author_id"]:
             data["author_id"] = paper["author_id"]
+            latest = self.versions.latest(conn, paper["id"])
+            data["authors"] = json.loads(latest["authors"]) if latest else []
         else:
             data["author_id"] = None  # 双盲：评审人看不到作者身份。
+            data["authors"] = None
         return data
 
     def list_papers(self, user_id: str) -> list[dict]:
@@ -210,21 +211,25 @@ class ReviewStore:
                 ).fetchall()
             return [self._paper_view(conn, row, user) for row in rows]
 
+    def _accessible_paper(self, conn: sqlite3.Connection, user: sqlite3.Row, paper_id: int) -> sqlite3.Row:
+        paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+        if not paper:
+            raise BusinessError("论文不存在", 404, "not_found")
+        if user["role"] == "reviewer":
+            allowed = conn.execute(
+                "SELECT 1 FROM assignments WHERE paper_id=? AND reviewer_id=? UNION SELECT 1 FROM bids WHERE paper_id=? AND reviewer_id=?",
+                (paper_id, user["id"], paper_id, user["id"]),
+            ).fetchone()
+            if not allowed:
+                raise BusinessError("评审人未获授权查看该论文", 403, "forbidden")
+        elif user["role"] == "author" and paper["author_id"] != user["id"]:
+            raise BusinessError("作者只能查看自己的论文", 403, "forbidden")
+        return paper
+
     def get_paper(self, user_id: str, paper_id: int) -> dict:
         with self.connect() as conn:
             user = self._user(conn, user_id)
-            paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
-            if not paper:
-                raise BusinessError("论文不存在", 404, "not_found")
-            if user["role"] == "reviewer":
-                allowed = conn.execute(
-                    "SELECT 1 FROM assignments WHERE paper_id=? AND reviewer_id=? UNION SELECT 1 FROM bids WHERE paper_id=? AND reviewer_id=?",
-                    (paper_id, user_id, paper_id, user_id),
-                ).fetchone()
-                if not allowed:
-                    raise BusinessError("评审人未获授权查看该论文", 403, "forbidden")
-            elif user["role"] == "author" and paper["author_id"] != user_id:
-                raise BusinessError("作者只能查看自己的论文", 403, "forbidden")
+            paper = self._accessible_paper(conn, user, paper_id)
             return self._paper_view(conn, paper, user)
 
     def add_conflict(self, chair_id: str, paper_id: int, reviewer_id: str, reason: str) -> dict:
@@ -387,6 +392,27 @@ class ReviewStore:
             rows = conn.execute("SELECT * FROM audit_log WHERE paper_id=? ORDER BY id", (paper_id,)).fetchall()
             return [dict(row) | {"detail": json.loads(row["detail"])} for row in rows]
 
+    def submit_final(self, user_id: str, paper_id: int, title: str, abstract: str,
+                     author_order: list, format_notes: str) -> dict:
+        """作者提交定稿；核对规则见 finalization.FinalizationService。"""
+        return self.finals.submit(user_id, paper_id, title, abstract, author_order, format_notes)
+
+    def approve_final(self, user_id: str, paper_id: int, change_reason: str = "") -> dict:
+        """主席核对定稿并签字，论文随即封版。"""
+        return self.finals.approve(user_id, paper_id, change_reason)
+
+    def get_final(self, user_id: str, paper_id: int) -> dict:
+        return self.finals.get_for_user(user_id, paper_id)
+
+    def list_versions(self, user_id: str, paper_id: int) -> list[dict]:
+        """全部内容版本（含只读送审版）；评审人视图为双盲。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            self._accessible_paper(conn, user, paper_id)
+            rows = self.versions.list(conn, paper_id)
+            include_authors = user["role"] != "reviewer"
+            return [VersionStore.to_dict(row, include_authors) for row in rows]
+
 
 class ReviewHandler(BaseHTTPRequestHandler):
     server_version = "AcademicReview/1.0"
@@ -414,17 +440,21 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def _user_id(self) -> str:
         return self.headers.get("X-User-Id", "")
 
+    def _serve_page(self, name: str) -> None:
+        html = (BASE_DIR / "web" / name).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html)))
+        self.end_headers()
+        self.wfile.write(html)
+
     def _dispatch(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         if method == "GET" and path == "/":
-            html = (BASE_DIR / "web" / "index.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html)))
-            self.end_headers()
-            self.wfile.write(html)
-            return
+            return self._serve_page("index.html")
+        if method == "GET" and path == "/final":
+            return self._serve_page("final.html")
         if method == "GET" and path == "/health":
             return self._send(200, {"ok": True})
         store = self._store()
@@ -457,6 +487,22 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 return self._send(201, store.decide(self._user_id(), paper_id, data.get("decision", ""), data.get("note", "")))
             if len(parts) == 4 and parts[3] == "history" and method == "GET":
                 return self._send(200, {"items": store.history(self._user_id(), paper_id)})
+            if len(parts) == 4 and parts[3] == "versions" and method == "GET":
+                return self._send(200, {"items": store.list_versions(self._user_id(), paper_id)})
+            if len(parts) == 4 and parts[3] == "final" and method == "GET":
+                return self._send(200, store.get_final(self._user_id(), paper_id))
+            if len(parts) == 4 and parts[3] == "final" and method == "POST":
+                data = self._body()
+                return self._send(201, store.submit_final(
+                    self._user_id(), paper_id,
+                    data.get("title", ""), data.get("abstract", ""),
+                    data.get("author_order", []), data.get("format_notes", ""),
+                ))
+            if len(parts) == 5 and parts[3] == "final" and parts[4] == "approve" and method == "POST":
+                data = self._body()
+                return self._send(200, store.approve_final(
+                    self._user_id(), paper_id, data.get("change_reason", ""),
+                ))
         if len(parts) == 4 and parts[:2] == ["api", "assignments"] and method == "POST":
             assignment_id = int(parts[2])
             data = self._body()
