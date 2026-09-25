@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>录用定稿</title>
+<style>
+body{font:16px system-ui;max-width:960px;margin:32px auto;padding:0 16px}
+input,textarea,select,button{font:inherit;padding:8px;margin:4px}
+textarea{width:100%;height:72px;box-sizing:border-box}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px}
+pre{white-space:pre-wrap;background:#f4f4f4;padding:12px;max-height:360px;overflow:auto}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;background:#e8eefc;font-size:13px}
+.warn{background:#fdecea}
+</style>
+</head>
+<body>
+<h1>录用定稿</h1>
+<p>
+  身份：
+  <select id="user"><option>alice</option><option>bob</option><option>chair</option></select>
+  论文 ID：<input id="paperId" size="5"> <button onclick="loadFinal()">查看定稿状态</button>
+  <a href="/">← 返回评审主页</a>
+</p>
+<div class="grid">
+  <section class="panel">
+    <h2>作者提交定稿</h2>
+    <p>仅接收/小修论文可提交；排版说明为空会被退回。提交后送审版自动设为只读。</p>
+    <input id="fTitle" placeholder="最终标题" style="width:96%">
+    <textarea id="fAbstract" placeholder="最终摘要（至少20字）"></textarea>
+    <input id="fAuthors" placeholder="作者顺序，逗号分隔，如 alice,bob" style="width:96%">
+    <textarea id="fTypes" placeholder="排版说明（必填），如字体、页码、终稿 PDF 链接"></textarea>
+    <button onclick="submitFinal()">提交定稿</button>
+  </section>
+  <section class="panel">
+    <h2>主席核对与验收</h2>
+    <p>最终标题或作者顺序与送审版不同时，必须核对并填写变更原因，再验收封版。</p>
+    <textarea id="fReason" placeholder="变更原因（标题/作者顺序变更时必填）"></textarea>
+    <button onclick="verifyFinal()">核对通过</button>
+    <button onclick="acceptFinal()">验收封版</button>
+  </section>
+</div>
+<section class="panel" style="margin-top:16px">
+  <h2>定稿状态与版本记录</h2>
+  <button onclick="loadFinal()">定稿信息</button>
+  <button onclick="loadVersions()">全部版本</button>
+  <pre id="out">尚未加载。</pre>
+</section>
+<script>
+const headers={"Content-Type":"application/json"};
+Object.defineProperty(headers,"X-User-Id",{
+  get(){return document.querySelector("#user").value},
+  configurable:true
+});
+async function api(url,opt){
+  const r=await fetch(url,{headers,...opt});
+  return {status:r.status,body:await r.json()};
+}
+const $=id=>document.getElementById(id);
+function show(data){$("out").textContent=JSON.stringify(data,null,2)}
+async function loadFinal(){
+  const id=$("paperId").value.trim();
+  show((await api(`/api/papers/${id}/final`)).body);
+}
+async function loadVersions(){
+  const id=$("paperId").value.trim();
+  show((await api(`/api/papers/${id}/versions`)).body);
+}
+async function submitFinal(){
+  const id=$("paperId").value.trim();
+  const authors=$("fAuthors").value.split(",").map(s=>s.trim()).filter(Boolean);
+  const res=await api(`/api/papers/${id}/final`,{method:"POST",body:JSON.stringify({
+    title:$("fTitle").value,
+    abstract:$("fAbstract").value,
+    authors,
+    typesetting:$("fTypes").value
+  })});
+  show({http_status:res.status,...res.body});
+}
+async function verifyFinal(){
+  const id=$("paperId").value.trim();
+  const res=await api(`/api/papers/${id}/final/verify`,{method:"POST",
+    body:JSON.stringify({change_reason:$("fReason").value})});
+  show({http_status:res.status,...res.body});
+}
+async function acceptFinal(){
+  const id=$("paperId").value.trim();
+  const res=await api(`/api/papers/${id}/final/accept`,{method:"POST"});
+  show({http_status:res.status,...res.body});
+}
+</script>
+</body>
+</html>
